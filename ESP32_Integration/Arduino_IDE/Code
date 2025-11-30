@@ -43,3 +43,231 @@ void loop() {
     }
   }
 }
+
+//VS CODE PYTHON SCRIPT TO CREATE A DASHBOARD-web.py
+# -----------------------------
+# Imports and serial connection remain the same
+# -----------------------------
+import mne
+import numpy as np
+from tensorflow.keras.models import load_model
+import joblib
+from scipy.ndimage import uniform_filter1d
+import serial
+from flask import Flask, jsonify, render_template_string, request
+import os
+import threading
+import time
+
+ser = serial.Serial('COM6', 115200, timeout=1)
+
+# Load model and scaler
+model = load_model("raw_trained_cnn.h5", compile=False)
+scaler = joblib.load("scaler_raw.pkl")
+
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Dashboard log for multiple files
+dashboard_log = []
+
+# -----------------------------
+# EEG Processing function
+# -----------------------------
+def process_eeg(files):
+    global dashboard_log
+    for file_path in files:
+        file_log = {
+            "file": os.path.basename(file_path),
+            "status": "Processing...",
+            "timings": [],
+            "percentage": 0
+        }
+        dashboard_log.append(file_log)
+        raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+        raw.filter(0.5, 70)
+        raw.rename_channels(lambda x: x.replace('# ', ''))
+        seen = {}
+        new_names = []
+        for ch in raw.ch_names:
+            if ch in seen:
+                seen[ch] += 1
+                new_names.append(f"{ch}-{seen[ch]}")
+            else:
+                seen[ch] = 0
+                new_names.append(ch)
+        raw.rename_channels(dict(zip(raw.ch_names, new_names)))
+
+        channels_23 = list(scaler.feature_names_in_)
+        channels_in_edf = [ch for ch in channels_23 if ch in raw.ch_names]
+        raw_data = raw.get_data()
+        sfreq = int(raw.info['sfreq'])
+
+        window_len = sfreq
+        step = window_len // 2
+        segments = []
+        for start in range(0, raw_data.shape[1] - window_len + 1, step):
+            end = start + window_len
+            seg = np.percentile(raw_data[:, start:end], 90, axis=1)
+            full_seg = np.zeros(len(channels_23))
+            for i, ch in enumerate(channels_in_edf):
+                idx = channels_23.index(ch)
+                edf_idx = raw.ch_names.index(ch)
+                full_seg[idx] = seg[edf_idx]
+            segments.append(full_seg)
+        segments = np.array(segments)
+
+        input_scaled = scaler.transform(segments)
+        input_cnn = input_scaled.reshape((input_scaled.shape[0], input_scaled.shape[1], 1))
+        predictions = model.predict(input_cnn, verbose=0)
+
+        prob_threshold = 0.95
+        merge_gap = 10.0
+        min_duration = 30.0
+        max_duration = 300.0
+
+        binary_preds = (predictions >= prob_threshold).astype(int).flatten()
+        smoothed = uniform_filter1d(binary_preds, size=5)
+        binary_preds = (smoothed >= 0.6).astype(int)
+
+        segment_times = []
+        for i, pred in enumerate(binary_preds):
+            start_sec = (i * step) / sfreq
+            end_sec = (i * step + window_len) / sfreq
+            if pred == 1:
+                segment_times.append((start_sec, end_sec))
+
+        merged_times = []
+        if segment_times:
+            current_start, current_end = segment_times[0]
+            for start, end in segment_times[1:]:
+                if start <= current_end + merge_gap:
+                    current_end = end
+                else:
+                    duration = current_end - current_start
+                    if min_duration <= duration <= max_duration:
+                        merged_times.append((current_start, current_end))
+                    current_start, current_end = start, end
+            duration = current_end - current_start
+            if min_duration <= duration <= max_duration:
+                merged_times.append((current_start, current_end))
+
+        final_seizure_detected = len(merged_times) > 0
+        seizure_pct = np.sum(binary_preds) / len(binary_preds) * 100
+
+        if final_seizure_detected:
+            file_log["status"] = "⚠️ Seizure Detected!"
+            file_log["timings"] = merged_times
+            ser.write(b"SEIZURE\n")
+        else:
+            file_log["status"] = "✅ No Seizure"
+            file_log["timings"] = []
+            ser.write(b"CLEAR\n")
+        file_log["percentage"] = seizure_pct
+
+# -----------------------------
+# Flask routes
+# -----------------------------
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        files = request.files.getlist("edf_file")
+        if files:
+            saved_paths = []
+            for f in files[:5]:  # limit to 5 files
+                if f.filename.endswith(".edf"):
+                    path = os.path.join(UPLOAD_FOLDER, f.filename)
+                    f.save(path)
+                    saved_paths.append(path)
+            threading.Thread(target=process_eeg, args=(saved_paths,), daemon=True).start()
+
+    html = '''
+    <html>
+    <head>
+        <title>Seizure Monitoring Dashboard</title>
+        <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+        <style>
+            body { font-family: Arial; background:#f0f2f5; text-align:center; }
+            .card { background:white; padding:20px; margin:20px auto; width:700px; border-radius:10px; box-shadow:0 4px 6px rgba(0,0,0,0.1); }
+            table { width:100%; border-collapse:collapse; margin-top:10px; }
+            th, td { border:1px solid #ccc; padding:8px; text-align:center; }
+            th { background:#eee; }
+            .upload { margin-top:20px; }
+            .loading { font-size:1.2em; color:blue; margin:10px; }
+        </style>
+    </head>
+    <body>
+        <h1>Seizure Monitoring Dashboard</h1>
+        <div class="card">
+            <div id="loading" class="loading" style="display:none;">⏳ Processing EDF file(s)...</div>
+            <div class="upload">
+                <form id="uploadForm" method="POST" enctype="multipart/form-data">
+                    <input type="file" name="edf_file" accept=".edf" multiple required>
+                    <input type="submit" value="Upload & Analyze">
+                </form>
+            </div>
+            <div id="log">
+                <table id="logTable">
+                    <thead>
+                        <tr>
+                            <th>File Name</th>
+                            <th>Status</th>
+                            <th>Seizure Timings</th>
+                            <th>Seizure %</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% for f in log %}
+                        <tr>
+                            <td>{{f.file}}</td>
+                            <td>{{f.status}}</td>
+                            <td>
+                            {% for t in f.timings %}
+                                ⏱ {{t[0]|round(2)}}s - {{t[1]|round(2)}}s<br>
+                            {% endfor %}
+                            </td>
+                            <td>{{f.percentage|round(2)}}%</td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <script>
+            $("#uploadForm").on("submit", function(){
+                $("#loading").show();
+            });
+
+            setInterval(function(){
+                $.getJSON("/status", function(data){
+                    let html = "";
+                    data.forEach(function(f){
+                        let timings_html = "";
+                        f.timings.forEach(function(t){
+                            timings_html += "⏱ "+t[0].toFixed(2)+"s - "+t[1].toFixed(2)+"s<br>";
+                        });
+                        html += "<tr><td>"+f.file+"</td><td>"+f.status+"</td><td>"+timings_html+"</td><td>"+f.percentage.toFixed(2)+"%</td></tr>";
+                    });
+                    $("#logTable tbody").html(html);
+                    let processing = data.some(f => f.status.includes("Processing"));
+                    if(processing){
+                        $("#loading").show();
+                    } else {
+                        $("#loading").hide();
+                    }
+                });
+            }, 1000);
+        </script>
+    </body>
+    </html>
+    '''
+    return render_template_string(html, log=dashboard_log)
+
+@app.route('/status')
+def status():
+    return jsonify(dashboard_log)
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
