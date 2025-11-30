@@ -1,1 +1,94 @@
+!pip install pandas
+import pandas as pd
 
+# Load raw 23-channel data
+preictal = pd.read_csv("chbmit_preictal_23channels_data.csv")
+ictal = pd.read_csv("chbmit_ictal_23channels_data.csv")
+preictal['outcome'] = 0  # preictal = 0
+ictal['outcome'] = 1     # ictal = 1
+data = pd.concat([preictal, ictal], axis=0).reset_index(drop=True)
+data = data.sample(frac=1).reset_index(drop=True)
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+X = data.drop('outcome', axis=1)
+y = data['outcome']
+
+X_scaled = scaler.fit_transform(X)
+from sklearn.model_selection import train_test_split
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.2, random_state=42, stratify=y
+)
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, Dense, Flatten, Dropout
+
+model = Sequential([
+    Conv1D(32, kernel_size=3, activation='relu', input_shape=(X_train.shape[1], 1)),
+    Dropout(0.3),
+    Flatten(),
+    Dense(64, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Reshape for Conv1D
+X_train_cnn = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
+X_test_cnn = X_test.reshape((X_test.shape[0], X_test.shape[1], 1))
+
+model.fit(X_train_cnn, y_train, epochs=20, batch_size=32, validation_data=(X_test_cnn, y_test))
+model.save("raw_trained_cnn.h5")
+import joblib
+joblib.dump(scaler, "scaler_raw.pkl")
+from sklearn.metrics import confusion_matrix, classification_report
+import numpy as np
+
+# Assume X_test, y_test are prepared as in training
+# X_test shape: (num_samples, num_channels, 1)
+# y_test shape: (num_samples,)
+
+# 1. Predict probabilities
+y_prob = model.predict(X_test)
+
+# 2. Convert to binary predictions
+threshold = 0.5  # or 0.75 if you want stricter
+y_pred = (y_prob >= threshold).astype(int).flatten()
+
+# 3. Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+print("Confusion Matrix:")
+print(cm)
+
+# 4. Classification Report
+cr = classification_report(y_test, y_pred, target_names=['Preictal (No Seizure)', 'Ictal (Seizure)'])
+print("\nClassification Report:")
+print(cr)
+
+import numpy as np
+import joblib
+from tensorflow.keras.models import load_model
+
+# --- Load saved scaler and model ---
+scaler = joblib.load("scaler_raw.pkl")
+model = load_model("raw_trained_cnn.h5")
+
+# --- EEG row (23 channels) ---
+row = np.array([3.77E-05, 5.68E-05, 2.29E-05, 9.08E-05,
+                2.68E-05, 2.17E-05, 2.68E-05, 3.30E-05,
+                -2.95E-05, -3.71E-06, 9.71E-05, -9.96E-06,
+                0.000102173, 2.01E-05, 5.18E-05, -2.95E-05,
+                1.15E-05, -2.79E-05, -8.15E-05, 1.43E-05,
+                2.83E-05, -3.61E-05, -3.61E-05], dtype=np.float32).reshape(1, -1)
+
+# --- Scale the row ---
+row_scaled = scaler.transform(row)
+
+# --- Reshape for Conv1D ---
+row_cnn = row_scaled.reshape(1, row_scaled.shape[1], 1)
+
+# --- Predict ---
+prediction = model.predict(row_cnn)
+print("Seizure probability:", prediction[0][0])
+print("Seizure detected?", "Yes" if prediction[0][0] > 0.5 else "No")
