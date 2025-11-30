@@ -1,1 +1,74 @@
+!pip install mne
+# Step 1: Upload EDF file
+from google.colab import files
+import mne
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import iirnotch, butter, filtfilt
+
+uploaded = files.upload()  # Choose your .edf file
+edf_file = list(uploaded.keys())[0]
+
+# Step 2: Load EDF file
+raw = mne.io.read_raw_edf(edf_file, preload=True)
+fs = int(raw.info['sfreq'])
+
+# Step 3: Filtering functions
+def notch_filter(sig, fs, freq=50.0, Q=30.0):
+    w0 = freq / (fs / 2)
+    b, a = iirnotch(w0, Q)
+    return filtfilt(b, a, sig)
+
+def bandpass_filter(sig, fs, lowcut=0.5, highcut=40.0, order=4):
+    low = lowcut / (fs / 2)
+    high = highcut / (fs / 2)
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, sig)
+
+def minmax_norm(sig):
+    return (sig - np.min(sig)) / (np.max(sig) - np.min(sig) + 1e-12)
+
+# Step 4: Extract all channels and process
+data, times = raw[:,:]   # all channels
+data = data * 1e6        # Convert to µV
+n_channels = data.shape[0]
+
+# Optional: segment for 2 seconds visualization
+seg_len = int(2 * fs)
+tseg = times[:seg_len]
+
+# Step 5: Plot all channels
+plt.figure(figsize=(12, n_channels*2))
+
+for ch in range(n_channels):
+    rawseg = data[ch, :seg_len]
+    filtered = bandpass_filter(notch_filter(data[ch, :], fs), fs)
+    filteredseg = filtered[:seg_len]
+    normseg = minmax_norm(filtered)[:seg_len]
+
+    # Raw EEG
+    plt.subplot(n_channels, 3, ch*3 + 1)
+    plt.plot(tseg, rawseg, color='red')
+    plt.title(f"{raw.ch_names[ch]} Raw")
+    plt.ylabel("µV")
+    plt.yticks(np.linspace(np.min(rawseg), np.max(rawseg), 4))
+
+    # Filtered EEG
+    plt.subplot(n_channels, 3, ch*3 + 2)
+    plt.plot(tseg, filteredseg, color='green')
+    plt.title(f"{raw.ch_names[ch]} Filtered")
+    plt.ylabel("µV")
+    plt.yticks(np.linspace(np.min(filteredseg), np.max(filteredseg), 4))
+
+    # Normalized EEG
+    plt.subplot(n_channels, 3, ch*3 + 3)
+    plt.plot(tseg, normseg, color='blue')
+    plt.title(f"{raw.ch_names[ch]} Normalized")
+    plt.ylabel("Norm")
+    plt.ylim(np.min(normseg), np.max(normseg))
+    plt.yticks(np.linspace(np.min(normseg), np.max(normseg), 4))
+
+plt.xlabel("Time (s)")
+plt.tight_layout()
+plt.show()
 
