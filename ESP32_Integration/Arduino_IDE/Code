@@ -1,0 +1,45 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* ssid = "WIFI_NAME";
+const char* password = "WIFI_Password";
+
+WebServer server(80);
+
+String alertMessage = "No seizure detected";
+
+void handleRoot() {
+  String html = "<h1>Seizure Monitoring</h1>";
+  html += "<p>Status: " + alertMessage + "</p>";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+
+  // Wait for WiFi connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected, IP: " + WiFi.localIP().toString());
+
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Read serial input from Python
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "SEIZURE") {
+      alertMessage = "⚠️ Seizure Detected!";
+    } else if (cmd == "CLEAR") {
+      alertMessage = "No seizure detected";
+    }
+  }
+}
